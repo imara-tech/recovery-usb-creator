@@ -196,13 +196,17 @@ function Run-Cmd {
     $processOutput = @()
     $exitCode = -1
     try {
-        $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $command" `
-            -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr `
-            -NoNewWindow -PassThru -ErrorAction Stop
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "cmd.exe"
+        $psi.Arguments = "/c $command > `"$tempOut`" 2>`"$tempErr`""
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $process = [System.Diagnostics.Process]::Start($psi)
         while (-not $process.HasExited) {
             [System.Windows.Forms.Application]::DoEvents()
             Start-Sleep -Milliseconds 150
         }
+        $process.WaitForExit()
         $exitCode = $process.ExitCode
     } catch {
         Log-ToFile -message "Failed to launch process: $_" -logFile $logFile
@@ -509,18 +513,24 @@ pause
 
         Log-ToAll -message "[2.1] Pausing for 2 seconds to allow OS to rescan disk..." -textBox $outputBox -logFile $logFile
         Start-Sleep -Seconds 2
+
         $refreshedDisk = Get-Disk -Number $usbDiskNumber
-        
         if ($refreshedDisk.PartitionStyle -eq 'Raw') {
-            Log-ToAll -message "[2.1] Disk is Raw. Initializing disk as MBR..." -textBox $outputBox -logFile $logFile
+            Log-ToAll -message "[2.1] Initializing disk as MBR..." -textBox $outputBox -logFile $logFile
             Initialize-Disk -Number $usbDiskNumber -PartitionStyle MBR -ErrorAction Stop
+        } elseif ($refreshedDisk.PartitionStyle -ne 'MBR') {
+            Log-ToAll -message "[2.1] Converting disk to MBR (required for bootable USB)..." -textBox $outputBox -logFile $logFile
+            Set-Disk -Number $usbDiskNumber -PartitionStyle MBR -ErrorAction Stop
         } else {
-            Log-ToAll -message "[2.1] Disk was already initialized by the OS. Skipping initialization." -textBox $outputBox -logFile $logFile
+            Log-ToAll -message "[2.1] Disk is already MBR." -textBox $outputBox -logFile $logFile
         }
 
         Log-ToAll -message "[2.1] Creating new partition..." -textBox $outputBox -logFile $logFile
         $newPartition = New-Partition -DiskNumber $usbDiskNumber -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
-        
+
+        Log-ToAll -message "[2.1] Marking partition as active (required for bootsect)..." -textBox $outputBox -logFile $logFile
+        Set-Partition -DiskNumber $usbDiskNumber -PartitionNumber $newPartition.PartitionNumber -IsActive $true -ErrorAction SilentlyContinue
+
         Log-ToAll -message "[2.1] Pausing for 2 seconds before formatting..." -textBox $outputBox -logFile $logFile
         Start-Sleep -Seconds 2
 
@@ -531,12 +541,29 @@ pause
         [System.Windows.Forms.MessageBox]::Show($parentForm, "An error occurred while preparing the disk. Please see the log for details. Try physically re-inserting the drive and running the script again.", "Preparation Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
         $createButton.Enabled = $true; $prepButton.Enabled = $true; return
     }
-    
+
     Log-ToAll -message "[2.2] Making USB drive bootable..." -textBox $outputBox -logFile $logFile
     $progressBar.Value = 7
     Start-Sleep -Seconds 3
-    if ((Run-Cmd "`"$bootsectPath`" /nt60 $usbDrive" -outputBox $outputBox -logFile $logFile).ExitCode -ne 0) {
-        Log-ToAll -message "Error: Failed to write bootsector. This is often caused by Antivirus software." -textBox $outputBox -logFile $logFile; $createButton.Enabled = $true; $prepButton.Enabled = $true; return
+
+    $driveLetterOnly = $usbDrive.TrimEnd('\').TrimEnd(':')
+    $partForUnmount = Get-Partition -DriveLetter $driveLetterOnly -ErrorAction SilentlyContinue
+    if ($partForUnmount) {
+        Log-ToAll -message "[2.2] Dismounting volume to release Explorer locks before bootsect..." -textBox $outputBox -logFile $logFile
+        Remove-PartitionAccessPath -DiskNumber $partForUnmount.DiskNumber -PartitionNumber $partForUnmount.PartitionNumber -AccessPath "$driveLetterOnly`:\" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        Add-PartitionAccessPath -DiskNumber $partForUnmount.DiskNumber -PartitionNumber $partForUnmount.PartitionNumber -AccessPath "$driveLetterOnly`:\" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+
+    Log-ToAll -message "[2.2] Running bootsect to write boot sector..." -textBox $outputBox -logFile $logFile
+    $bootsectOutput = & "$bootsectPath" /nt60 $usbDrive /force 2>&1
+    $bootsectExit = $LASTEXITCODE
+    foreach ($line in $bootsectOutput) { Log-ToFile -message ([string]$line) -logFile $logFile }
+    Log-ToFile -message "bootsect exited with code: $bootsectExit" -logFile $logFile
+    if ($bootsectExit -ne 0) {
+        Log-ToAll -message "Error: Failed to write bootsector (exit $bootsectExit). Check log for details." -textBox $outputBox -logFile $logFile
+        $createButton.Enabled = $true; $prepButton.Enabled = $true; return
     }
     
     Log-ToAll -message "[2.3] Copying all temporary files to USB drive..." -textBox $outputBox -logFile $logFile
